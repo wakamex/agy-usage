@@ -1,0 +1,25 @@
+[project]
+name = "agy-usage"
+version = "0.1.0"
+description = "Antigravity CLI usage and quota monitor"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agy_usage"]
+
+[project.urls]
+Homepage = "https://github.com/wakamex/agy-usage"
+Source = "https://github.com/wakamex/agy-usage"
+
+[project.scripts]
+agy-usage = "agy_usage:main"
+agyusage = "agy_usage:main"

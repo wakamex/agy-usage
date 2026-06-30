@@ -1,0 +1,20 @@
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[options]
+exclude-newer = "2026-06-23T03:29:12.769788954Z"
+exclude-newer-span = "P7D"
+
+[options.exclude-newer-package]
+clanker-analytics = false
+ghp = false
+search-claude-history = false
+gemini-cli-usage = false
+ccusage = false
+codex-cli-usage = false
+
+[[package]]
+name = "agy-usage"
+version = "0.1.0"
+source = { editable = "." }
