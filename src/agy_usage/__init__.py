@@ -6,7 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
+import ssl
+import subprocess
 import sys
 import time
 import urllib.error
@@ -26,6 +29,7 @@ DEFAULT_USAGE_FILE = AGY_DIR / "usage-limits.json"
 DAEMON_INTERVAL = 300
 CACHE_MAX_AGE = 300
 CODE_ASSIST_BASE_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal"
+QUOTA_SUMMARY_RPC = "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
 
 _TTY = sys.stdout.isatty()
 _RED = "\033[0;31m" if _TTY else ""
@@ -66,6 +70,10 @@ def _format_duration_until(iso_timestamp: str | None) -> str:
     if seconds <= 0:
         return ""
     minutes = seconds // 60
+    if minutes >= 24 * 60:
+        days = minutes // (24 * 60)
+        hours = (minutes % (24 * 60)) // 60
+        return f"{days}d{hours}h"
     if minutes >= 60:
         return f"{minutes // 60}h{minutes % 60}m"
     return f"{minutes}m"
@@ -85,6 +93,14 @@ def _color_pct(pct: float | int | None) -> str:
         return "?"
     value = float(pct)
     color = _RED if value >= 70 else _YELLOW if value >= 40 else _GREEN
+    return f"{color}{_format_pct(value)}{_RESET}"
+
+
+def _color_remaining_pct(pct: float | int | None) -> str:
+    if pct is None:
+        return "?"
+    value = float(pct)
+    color = _GREEN if value >= 70 else _YELLOW if value >= 40 else _RED
     return f"{color}{_format_pct(value)}{_RESET}"
 
 
@@ -132,7 +148,7 @@ def _code_assist_post(method: str, payload: dict, access_token: str) -> dict:
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "agy-usage/0.1.0",
+            "User-Agent": "agy-usage/0.1.1",
         },
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
@@ -168,6 +184,117 @@ def _read_default_project_id() -> str | None:
     except OSError:
         return None
     return project_id or None
+
+
+def _local_rpc_base_urls() -> list[str]:
+    override = os.environ.get("AGY_RPC_URL") or os.environ.get("ANTIGRAVITY_RPC_URL")
+    if override:
+        return [override.rstrip("/")]
+
+    ports: list[str] = []
+    try:
+        result = subprocess.run(
+            ["ss", "-ltnp"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        result = None
+
+    if result:
+        for line in result.stdout.splitlines():
+            if '"agy"' not in line and "users:((agy," not in line:
+                continue
+            match = re.search(r"127\.0\.0\.1:(\d+)", line)
+            if match:
+                ports.append(match.group(1))
+
+    ports.extend(["42683", "42075"])
+    ordered_ports = list(dict.fromkeys(ports))
+    base_urls: list[str] = []
+    for port in ordered_ports:
+        base_urls.append(f"http://127.0.0.1:{port}")
+        base_urls.append(f"https://127.0.0.1:{port}")
+    return base_urls
+
+
+def _local_connect_post(base_url: str, rpc_path: str, payload: dict) -> dict:
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}{rpc_path}",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "agy-usage/0.1.1",
+        },
+    )
+    kwargs: dict[str, Any] = {"timeout": 4}
+    if base_url.startswith("https://"):
+        kwargs["context"] = ssl._create_unverified_context()
+    with urllib.request.urlopen(req, **kwargs) as resp:
+        return json.loads(resp.read())
+
+
+def _parse_quota_summary(summary: dict) -> dict:
+    groups = []
+    for group in summary.get("groups") or []:
+        if not isinstance(group, dict):
+            continue
+        buckets = []
+        for bucket in group.get("buckets") or []:
+            if not isinstance(bucket, dict):
+                continue
+            remaining_fraction = bucket.get("remainingFraction")
+            remaining_pct = None
+            if isinstance(remaining_fraction, int | float):
+                remaining_pct = float(remaining_fraction) * 100
+            buckets.append(
+                {
+                    "bucket_id": bucket.get("bucketId"),
+                    "display_name": bucket.get("displayName") or bucket.get("bucketId") or "Quota",
+                    "description": bucket.get("description"),
+                    "window": bucket.get("window"),
+                    "remaining_fraction": remaining_fraction,
+                    "remaining_pct": remaining_pct,
+                    "reset_time": bucket.get("resetTime"),
+                    "disabled": bool(bucket.get("disabled", False)),
+                }
+            )
+        groups.append(
+            {
+                "display_name": group.get("displayName") or "Quota",
+                "description": group.get("description"),
+                "buckets": buckets,
+            }
+        )
+    return {"description": summary.get("description"), "groups": groups}
+
+
+def fetch_quota_summary() -> dict:
+    project_id = (
+        os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or os.environ.get("GOOGLE_CLOUD_PROJECT_ID")
+        or _read_default_project_id()
+        or "default-cli-project"
+    )
+    payload = {"request": {"project": project_id}, "forceRefresh": True}
+    errors = []
+    for base_url in _local_rpc_base_urls():
+        try:
+            response = _local_connect_post(base_url, QUOTA_SUMMARY_RPC, payload)
+        except Exception as exc:
+            errors.append(f"{base_url}: {exc}")
+            continue
+        summary = response.get("response") if isinstance(response, dict) else None
+        if isinstance(summary, dict):
+            parsed = _parse_quota_summary(summary)
+            parsed["project_id"] = project_id
+            parsed["rpc_url"] = base_url
+            return parsed
+        errors.append(f"{base_url}: missing response")
+    raise RuntimeError("No running agy quota RPC found" + (f" ({'; '.join(errors[:3])})" if errors else ""))
 
 
 def _parse_quota_buckets(buckets: list[dict]) -> list[dict]:
@@ -301,10 +428,15 @@ def build_usage_json(project_root: Path | None = None) -> dict:
         result["source"].append("history")
 
     try:
-        result["account_quota"] = fetch_quota()
-        result["source"].append("quota_api")
-    except Exception as exc:
-        result["quota_error"] = str(exc)
+        result["quota_summary"] = fetch_quota_summary()
+        result["source"].append("quota_summary_rpc")
+    except Exception as summary_exc:
+        result["quota_summary_error"] = str(summary_exc)
+        try:
+            result["account_quota"] = fetch_quota()
+            result["source"].append("quota_api")
+        except Exception as exc:
+            result["quota_error"] = str(exc)
 
     return result
 
@@ -321,34 +453,67 @@ def _print_status(data: dict):
     if model:
         print(f"Model: {model}")
 
-    quota = data.get("account_quota")
-    if quota:
-        bucket_names = [
-            (bucket.get("model") or "unknown")
-            for bucket in quota.get("buckets", [])
-            if isinstance(bucket, dict)
-        ]
-        name_width = max(map(len, bucket_names), default=len("Quota"))
-        for bucket in quota.get("buckets", []):
-            model_name = bucket.get("model") or "unknown"
-            if bucket.get("disabled"):
-                print(f"  {model_name:{name_width}s} {_DIM}disabled{_RESET}")
-                continue
-            reset_time = _format_duration_until(bucket.get("reset_time"))
-            reset_part = f"  resets {reset_time}" if reset_time else ""
-            remaining = bucket.get("remaining")
-            limit = bucket.get("limit")
-            remain_part = (
-                f"  {remaining} / {limit} remaining"
-                if remaining is not None and limit is not None
-                else ""
-            )
-            print(
-                f"  {model_name:{name_width}s} {_color_pct(bucket.get('used_pct'))} used"
-                f"{remain_part}{_DIM}{reset_part}{_RESET}"
-            )
-    elif data.get("quota_error"):
-        print(f"  {'Quota':20s} {_DIM}{data['quota_error']}{_RESET}")
+    quota_summary = data.get("quota_summary")
+    if quota_summary:
+        for group in quota_summary.get("groups", []):
+            print()
+            print(str(group.get("display_name") or "Quota").upper())
+            if group.get("description"):
+                print(f"  {_DIM}{group['description']}{_RESET}")
+
+            bucket_names = [
+                str(bucket.get("display_name") or "Quota")
+                for bucket in group.get("buckets", [])
+                if isinstance(bucket, dict)
+            ]
+            name_width = max(map(len, bucket_names), default=len("Quota"))
+            for bucket in group.get("buckets", []):
+                bucket_name = str(bucket.get("display_name") or "Quota")
+                if bucket.get("disabled"):
+                    print(f"  {bucket_name:{name_width}s} {_DIM}disabled{_RESET}")
+                    continue
+                remaining_pct = bucket.get("remaining_pct")
+                if remaining_pct is None:
+                    print(f"  {bucket_name:{name_width}s} ? remaining")
+                    continue
+                if float(remaining_pct) >= 99.995:
+                    reset_part = f"{_DIM}quota available{_RESET}"
+                else:
+                    reset_time = _format_duration_until(bucket.get("reset_time"))
+                    reset_part = f"{_DIM}resets {reset_time}{_RESET}" if reset_time else ""
+                print(
+                    f"  {bucket_name:{name_width}s} "
+                    f"{_color_remaining_pct(remaining_pct)} remaining  {reset_part}".rstrip()
+                )
+    else:
+        quota = data.get("account_quota")
+        if quota:
+            bucket_names = [
+                (bucket.get("model") or "unknown")
+                for bucket in quota.get("buckets", [])
+                if isinstance(bucket, dict)
+            ]
+            name_width = max(map(len, bucket_names), default=len("Quota"))
+            for bucket in quota.get("buckets", []):
+                model_name = bucket.get("model") or "unknown"
+                if bucket.get("disabled"):
+                    print(f"  {model_name:{name_width}s} {_DIM}disabled{_RESET}")
+                    continue
+                reset_time = _format_duration_until(bucket.get("reset_time"))
+                reset_part = f"  resets {reset_time}" if reset_time else ""
+                remaining = bucket.get("remaining")
+                limit = bucket.get("limit")
+                remain_part = (
+                    f"  {remaining} / {limit} remaining"
+                    if remaining is not None and limit is not None
+                    else ""
+                )
+                print(
+                    f"  {model_name:{name_width}s} {_color_pct(bucket.get('used_pct'))} used"
+                    f"{remain_part}{_DIM}{reset_part}{_RESET}"
+                )
+        elif data.get("quota_error"):
+            print(f"  {'Quota':20s} {_DIM}{data['quota_error']}{_RESET}")
 
     history = data.get("history") or {}
     if history.get("entries"):
@@ -356,18 +521,53 @@ def _print_status(data: dict):
         print(f"History: {history['entries']} entries, latest {latest}")
 
 
+def _pick_statusline_summary_bucket(quota_summary: dict) -> dict | None:
+    groups = quota_summary.get("groups") or []
+    gemini_groups = [
+        group for group in groups if "gemini" in str(group.get("display_name") or "").lower()
+    ]
+    candidates = gemini_groups or groups
+    buckets = [
+        bucket
+        for group in candidates
+        for bucket in group.get("buckets", [])
+        if isinstance(bucket, dict) and not bucket.get("disabled")
+    ]
+    for bucket in buckets:
+        if str(bucket.get("window") or "").lower() == "5h":
+            return bucket
+    scored = [bucket for bucket in buckets if bucket.get("remaining_pct") is not None]
+    if scored:
+        return min(scored, key=lambda bucket: bucket["remaining_pct"])
+    return buckets[0] if buckets else None
+
+
 def _statusline_text(data: dict) -> str:
     parts = []
-    quota = data.get("account_quota")
-    if quota and quota.get("summary_bucket"):
-        summary = quota["summary_bucket"]
-        if summary.get("disabled"):
-            parts.append("q:disabled")
-        elif summary.get("used_pct") is not None:
-            parts.append(f"q:{_format_pct(summary['used_pct'])}")
-        reset_time = _format_duration_until(summary.get("reset_time"))
-        if reset_time:
-            parts.append(f"reset:{reset_time}")
+    quota_summary = data.get("quota_summary")
+    if quota_summary:
+        summary_bucket = _pick_statusline_summary_bucket(quota_summary)
+        if summary_bucket:
+            if summary_bucket.get("disabled"):
+                parts.append("q:disabled")
+            elif summary_bucket.get("remaining_pct") is not None:
+                parts.append(f"q:{_format_pct(summary_bucket['remaining_pct'])}left")
+            reset_time = ""
+            if float(summary_bucket.get("remaining_pct") or 0) < 99.995:
+                reset_time = _format_duration_until(summary_bucket.get("reset_time"))
+            if reset_time:
+                parts.append(f"reset:{reset_time}")
+    elif data.get("account_quota"):
+        quota = data["account_quota"]
+        if quota.get("summary_bucket"):
+            summary = quota["summary_bucket"]
+            if summary.get("disabled"):
+                parts.append("q:disabled")
+            elif summary.get("used_pct") is not None:
+                parts.append(f"q:{_format_pct(summary['used_pct'])}")
+            reset_time = _format_duration_until(summary.get("reset_time"))
+            if reset_time:
+                parts.append(f"reset:{reset_time}")
     elif data.get("quota_error"):
         parts.append("q:err")
 
@@ -390,7 +590,8 @@ def _get_cached_usage(
             updated = _parse_iso(cached.get("updated_at"))
             if updated and cached.get("project_root") == root:
                 age = (datetime.now(UTC) - updated).total_seconds()
-                if age < max_age and "quota_api" in cached.get("source", []):
+                quota_sources = {"quota_summary_rpc", "quota_api"}
+                if age < max_age and quota_sources.intersection(cached.get("source", [])):
                     return cached
         except Exception:
             pass

@@ -9,14 +9,23 @@ terminal output, JSON output, statusline output, and a cache-refresh daemon.
 ```text
 Project: agy-usage
 Model: Gemini 3.5 Flash (High)
-  gemini-3.5-flash-high  12.4% used  resets 1h05m
+
+GEMINI MODELS
+  Models within this group: Gemini Flash, Gemini Pro
+  Weekly Limit    95.0% remaining  resets 6d19h
+  Five Hour Limit 62.5% remaining  resets 7m
+
+CLAUDE AND GPT MODELS
+  Models within this group: Claude Opus, Claude Sonnet, GPT-OSS
+  Weekly Limit    100.0% remaining  quota available
+  Five Hour Limit 100.0% remaining  quota available
 History: 24 entries, latest 2026-06-29T22:53:01+00:00
 ```
 
 Statusline:
 
 ```text
-q:12.4% reset:1h05m model:Gemini_3.5_Flash_(High)
+q:62.5%left reset:7m model:Gemini_3.5_Flash_(High)
 ```
 
 ## Install
@@ -50,8 +59,14 @@ uv tool install .
 - Antigravity command history: `~/.gemini/antigravity-cli/history.jsonl`
 - Cache written by this tool: `~/.gemini/antigravity-cli/usage-limits.json`
 
-Quota lookup uses the same Code Assist quota flow Antigravity logs mention:
-`loadCodeAssist` followed by `retrieveUserQuota`.
+Quota lookup first uses the local Antigravity CLI language-server RPC, which
+is the source behind `agy`'s grouped "Models & Quota" display. Keep an `agy`
+session running for the closest match, or set `AGY_RPC_URL` to a known local
+RPC base URL.
+
+If the local RPC is unavailable, `agy-usage` falls back to the raw Code Assist
+quota flow Antigravity logs mention: `loadCodeAssist` followed by
+`retrieveUserQuota`.
 
 ## Options
 
@@ -68,5 +83,6 @@ usage: agy-usage [-h] [--root ROOT] [-i INTERVAL] [--max-age MAX_AGE]
 Environment overrides:
 
 - `AGY_USAGE_FILE`: alternate cache path
+- `AGY_RPC_URL`: local Antigravity RPC base URL, for example `http://127.0.0.1:42683`
 - `AGY_ACCESS_TOKEN`: provide an access token instead of reading Antigravity state
 - `AGY_CODE_ASSIST_BASE_URL`: alternate Code Assist base URL

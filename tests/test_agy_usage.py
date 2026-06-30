@@ -45,6 +45,65 @@ class AgyUsageTests(unittest.TestCase):
 
         self.assertEqual(agy_usage._select_summary_bucket(quota)["model"], "pro")
 
+    def test_parse_quota_summary_groups(self):
+        summary = agy_usage._parse_quota_summary(
+            {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "description": "Models within this group: Gemini Flash, Gemini Pro",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-5h",
+                                "displayName": "Five Hour Limit",
+                                "window": "5h",
+                                "remainingFraction": 0.625,
+                                "resetTime": "2026-06-30T04:00:00Z",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(summary["groups"][0]["display_name"], "Gemini Models")
+        self.assertEqual(summary["groups"][0]["buckets"][0]["display_name"], "Five Hour Limit")
+        self.assertEqual(summary["groups"][0]["buckets"][0]["remaining_pct"], 62.5)
+
+    def test_statusline_uses_gemini_five_hour_remaining(self):
+        reset_time = (datetime.now(UTC) + timedelta(minutes=7)).isoformat()
+        data = {
+            "quota_summary": {
+                "groups": [
+                    {
+                        "display_name": "Gemini Models",
+                        "buckets": [
+                            {"display_name": "Weekly Limit", "window": "weekly", "remaining_pct": 95.0},
+                            {
+                                "display_name": "Five Hour Limit",
+                                "window": "5h",
+                                "remaining_pct": 62.5,
+                                "reset_time": reset_time,
+                            },
+                        ],
+                    },
+                    {
+                        "display_name": "Claude and GPT models",
+                        "buckets": [
+                            {"display_name": "Five Hour Limit", "window": "5h", "remaining_pct": 100.0}
+                        ],
+                    },
+                ]
+            },
+            "model": "Gemini Test",
+        }
+
+        statusline = agy_usage._statusline_text(data)
+
+        self.assertIn("q:62.5%left", statusline)
+        self.assertIn("reset:", statusline)
+        self.assertIn("model:Gemini_Test", statusline)
+
     def test_read_history_summary_counts_commands_and_workspaces(self):
         with tempfile.TemporaryDirectory() as tmp:
             history = Path(tmp) / "history.jsonl"
@@ -97,12 +156,18 @@ class AgyUsageTests(unittest.TestCase):
             with (
                 mock.patch.object(agy_usage, "HISTORY_FILE", history),
                 mock.patch.object(agy_usage, "SETTINGS_FILE", settings),
+                mock.patch.object(
+                    agy_usage,
+                    "fetch_quota_summary",
+                    side_effect=RuntimeError("no quota summary"),
+                ),
                 mock.patch.object(agy_usage, "fetch_quota", side_effect=RuntimeError("no quota")),
             ):
                 usage = agy_usage.build_usage_json(tmp_path)
 
         self.assertEqual(usage["model"], "Gemini Test")
         self.assertIn("history", usage["source"])
+        self.assertEqual(usage["quota_summary_error"], "no quota summary")
         self.assertEqual(usage["quota_error"], "no quota")
 
     def test_force_refresh_bypasses_cache(self):
@@ -113,12 +178,12 @@ class AgyUsageTests(unittest.TestCase):
             usage_file = tmp_path / "usage-limits.json"
             cached = {
                 "project_root": str(project_root.resolve()),
-                "source": ["quota_api"],
+                "source": ["quota_summary_rpc"],
                 "updated_at": datetime.now(UTC).isoformat(),
             }
             fresh = {
                 "project_root": str(project_root.resolve()),
-                "source": ["quota_api"],
+                "source": ["quota_summary_rpc"],
                 "updated_at": (datetime.now(UTC) + timedelta(seconds=1)).isoformat(),
             }
             usage_file.write_text(json.dumps(cached) + "\n")
