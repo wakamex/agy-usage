@@ -315,6 +315,16 @@ def _parse_quota_summary(summary: dict) -> dict:
     return {"description": summary.get("description"), "groups": groups}
 
 
+def _parse_subscription_plan(load_code_assist: dict) -> str | None:
+    for key in ("paidTier", "currentTier"):
+        tier = load_code_assist.get(key)
+        if isinstance(tier, dict):
+            name = tier.get("name")
+            if isinstance(name, str) and name:
+                return name
+    return None
+
+
 def _load_antigravity_code_assist(access_token: str) -> dict:
     return _code_assist_post(
         "loadCodeAssist",
@@ -334,6 +344,7 @@ def fetch_quota_summary() -> dict:
             summary = _code_assist_post("retrieveUserQuotaSummary", {"project": project_id}, access_token)
             parsed = _parse_quota_summary(summary)
             parsed["project_id"] = project_id
+            parsed["plan"] = _parse_subscription_plan(load_res)
             parsed["source"] = "quota_summary_api"
             return parsed
         except urllib.error.HTTPError as exc:
@@ -392,6 +403,7 @@ def build_usage_json(project_root: Path | None = None) -> dict:
     result = {
         "project_root": str(root),
         "model": settings.get("model"),
+        "plan": None,
         "source": [],
         "updated_at": _iso_now(),
         "history": read_history_summary(),
@@ -401,6 +413,7 @@ def build_usage_json(project_root: Path | None = None) -> dict:
 
     try:
         result["quota_summary"] = fetch_quota_summary()
+        result["plan"] = result["quota_summary"].get("plan")
         result["source"].append(result["quota_summary"].get("source") or "quota_summary")
     except Exception as summary_exc:
         result["quota_summary_error"] = str(summary_exc)
@@ -419,6 +432,9 @@ def _print_status(data: dict):
     model = data.get("model")
     if model:
         print(f"Model: {model}")
+    plan = data.get("plan")
+    if plan:
+        print(f"Plan: {plan}")
 
     quota_summary = data.get("quota_summary")
     if quota_summary:

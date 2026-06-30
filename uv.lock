@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.12"
 
 [options]
-exclude-newer = "2026-06-23T05:02:16.50976567Z"
+exclude-newer = "2026-06-23T05:12:11.823653707Z"
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
@@ -16,5 +16,5 @@ codex-cli-usage = false
 
 [[package]]
 name = "agy-usage"
-version = "0.1.3"
+version = "0.1.4"
 source = { editable = "." }

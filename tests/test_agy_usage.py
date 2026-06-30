@@ -78,6 +78,16 @@ class AgyUsageTests(unittest.TestCase):
         self.assertIn("reset:", statusline)
         self.assertIn("model:Gemini_Test", statusline)
 
+    def test_subscription_plan_prefers_paid_tier(self):
+        plan = agy_usage._parse_subscription_plan(
+            {
+                "currentTier": {"name": "Antigravity"},
+                "paidTier": {"name": "Google AI Pro"},
+            }
+        )
+
+        self.assertEqual(plan, "Google AI Pro")
+
     def test_fetch_quota_summary_uses_antigravity_project(self):
         summary_response = {
             "groups": [
@@ -94,7 +104,10 @@ class AgyUsageTests(unittest.TestCase):
                 agy_usage,
                 "_code_assist_post",
                 side_effect=[
-                    {"cloudaicompanionProject": "healthy-shore-gs5kt"},
+                    {
+                        "cloudaicompanionProject": "healthy-shore-gs5kt",
+                        "paidTier": {"name": "Google AI Pro"},
+                    },
                     summary_response,
                 ],
             ) as post_mock,
@@ -102,6 +115,7 @@ class AgyUsageTests(unittest.TestCase):
             summary = agy_usage.fetch_quota_summary()
 
         self.assertEqual(summary["project_id"], "healthy-shore-gs5kt")
+        self.assertEqual(summary["plan"], "Google AI Pro")
         self.assertEqual(summary["source"], "quota_summary_api")
         self.assertEqual(summary["groups"][0]["buckets"][0]["remaining_pct"], 50.0)
         self.assertEqual(
@@ -265,7 +279,7 @@ class AgyUsageTests(unittest.TestCase):
         self.assertEqual(summary["groups"][0]["buckets"][0]["remaining_pct"], 75.0)
         token_mock.assert_has_calls([mock.call(), mock.call(force_refresh=True)])
 
-    def test_build_usage_json_includes_history_when_quota_fails(self):
+    def test_build_usage_json_includes_history_and_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             history = tmp_path / "history.jsonl"
@@ -276,17 +290,14 @@ class AgyUsageTests(unittest.TestCase):
             with (
                 mock.patch.object(agy_usage, "HISTORY_FILE", history),
                 mock.patch.object(agy_usage, "SETTINGS_FILE", settings),
-                mock.patch.object(
-                    agy_usage,
-                    "fetch_quota_summary",
-                    side_effect=RuntimeError("no quota summary"),
-                ),
+                mock.patch.object(agy_usage, "fetch_quota_summary", return_value={"plan": "Google AI Pro"}),
             ):
                 usage = agy_usage.build_usage_json(tmp_path)
 
         self.assertEqual(usage["model"], "Gemini Test")
+        self.assertEqual(usage["plan"], "Google AI Pro")
         self.assertIn("history", usage["source"])
-        self.assertEqual(usage["quota_summary_error"], "no quota summary")
+        self.assertNotIn("quota_summary_error", usage)
         self.assertNotIn("account_quota", usage)
 
     def test_force_refresh_bypasses_cache(self):
