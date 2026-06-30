@@ -7,13 +7,16 @@ import argparse
 import gzip
 import json
 import os
+import re
+import shutil
 import signal
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 AGY_DIR = Path.home() / ".gemini" / "antigravity-cli"
@@ -26,6 +29,7 @@ DAEMON_INTERVAL = 300
 CACHE_MAX_AGE = 300
 CODE_ASSIST_BASE_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal"
 AGY_USER_AGENT = "antigravity/cli/1.0.14 (aidev_client; os_type=linux; arch=amd64)"
+OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 _TTY = sys.stdout.isatty()
 _RED = "\033[0;31m" if _TTY else ""
@@ -107,7 +111,125 @@ def get_auth() -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def get_access_token() -> str:
+def _get_token_payload(auth: dict) -> dict:
+    token_payload = auth.get("token")
+    if isinstance(token_payload, dict):
+        return token_payload
+    return auth
+
+
+def _write_auth(auth: dict):
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = TOKEN_FILE.parent / (TOKEN_FILE.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(auth, indent=2) + "\n")
+        os.replace(tmp, TOKEN_FILE)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _auth_expires_soon(auth: dict) -> bool:
+    expiry = _get_token_payload(auth).get("expiry")
+    parsed = _parse_iso(expiry if isinstance(expiry, str) else None)
+    if not parsed:
+        return False
+    return (parsed - datetime.now(UTC)).total_seconds() < 60
+
+
+def _oauth_client_candidates() -> list[tuple[str, str]]:
+    env_client_id = os.environ.get("AGY_OAUTH_CLIENT_ID")
+    env_client_secret = os.environ.get("AGY_OAUTH_CLIENT_SECRET")
+    if env_client_id and env_client_secret:
+        return [(env_client_id, env_client_secret)]
+
+    agy_bin = shutil.which("agy")
+    if not agy_bin:
+        raise RuntimeError("OAuth access token expired and `agy` is not on PATH")
+
+    try:
+        data = Path(agy_bin).read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"OAuth access token expired and could not read {agy_bin}") from exc
+
+    client_ids = [
+        match.group(0).decode()
+        for match in re.finditer(rb"\d+-[a-z0-9]+\.apps\.googleusercontent\.com", data)
+    ]
+    secret_prefix = b"GO" + b"CSPX-"
+    secret_pattern = re.escape(secret_prefix) + rb"[A-Za-z0-9_-]{28}"
+    secrets = [match.group(0).decode() for match in re.finditer(secret_pattern, data)]
+    candidates = []
+    for client_id in reversed(client_ids):
+        for client_secret in secrets:
+            pair = (client_id, client_secret)
+            if pair not in candidates:
+                candidates.append(pair)
+    if not candidates:
+        raise RuntimeError("OAuth access token expired and no Antigravity OAuth client metadata was found")
+    return candidates
+
+
+def _refresh_access_token_with_client(refresh_token: str, client_id: str, client_secret: str) -> dict:
+    payload = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        OAUTH_TOKEN_URL,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def refresh_access_token(auth: dict) -> dict:
+    token_payload = _get_token_payload(auth)
+    refresh_token = token_payload.get("refresh_token") or auth.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise RuntimeError("No refresh token in ~/.gemini/antigravity-cli/antigravity-oauth-token")
+
+    result = None
+    last_error: Exception | None = None
+    for client_id, client_secret in _oauth_client_candidates():
+        try:
+            result = _refresh_access_token_with_client(refresh_token, client_id, client_secret)
+            break
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code in (400, 401):
+                continue
+            raise
+    if result is None:
+        raise RuntimeError("Token refresh failed with Antigravity OAuth client metadata") from last_error
+
+    updated = dict(auth)
+    updated_token = dict(token_payload)
+    updated_token["access_token"] = result["access_token"]
+    updated_token["token_type"] = result.get("token_type", updated_token.get("token_type", "Bearer"))
+    if result.get("refresh_token"):
+        updated_token["refresh_token"] = result["refresh_token"]
+    expires_in = int(result.get("expires_in", 3600))
+    updated_token["expiry"] = (datetime.now(UTC) + timedelta(seconds=expires_in)).isoformat().replace("+00:00", "Z")
+    if isinstance(auth.get("token"), dict):
+        updated["token"] = updated_token
+    else:
+        updated.update(updated_token)
+    _write_auth(updated)
+    return updated
+
+
+def get_access_token(force_refresh: bool = False) -> str:
     env_token = os.environ.get("AGY_ACCESS_TOKEN") or os.environ.get("ANTIGRAVITY_ACCESS_TOKEN")
     if env_token:
         return env_token
@@ -115,6 +237,9 @@ def get_access_token() -> str:
     auth = get_auth()
     if not auth:
         raise RuntimeError("No Antigravity OAuth token at ~/.gemini/antigravity-cli/antigravity-oauth-token")
+
+    if force_refresh or _auth_expires_soon(auth):
+        auth = refresh_access_token(auth)
 
     token_payload = auth.get("token")
     token = auth.get("access_token") or auth.get("AccessToken")
@@ -200,15 +325,23 @@ def _load_antigravity_code_assist(access_token: str) -> dict:
 
 def fetch_quota_summary() -> dict:
     access_token = get_access_token()
-    load_res = _load_antigravity_code_assist(access_token)
-    project_id = load_res.get("cloudaicompanionProject")
-    if not project_id:
-        raise RuntimeError("No Antigravity Code Assist project returned by loadCodeAssist")
-    summary = _code_assist_post("retrieveUserQuotaSummary", {"project": project_id}, access_token)
-    parsed = _parse_quota_summary(summary)
-    parsed["project_id"] = project_id
-    parsed["source"] = "quota_summary_api"
-    return parsed
+    for attempt in range(2):
+        try:
+            load_res = _load_antigravity_code_assist(access_token)
+            project_id = load_res.get("cloudaicompanionProject")
+            if not project_id:
+                raise RuntimeError("No Antigravity Code Assist project returned by loadCodeAssist")
+            summary = _code_assist_post("retrieveUserQuotaSummary", {"project": project_id}, access_token)
+            parsed = _parse_quota_summary(summary)
+            parsed["project_id"] = project_id
+            parsed["source"] = "quota_summary_api"
+            return parsed
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403) and attempt == 0:
+                access_token = get_access_token(force_refresh=True)
+                continue
+            raise
+    raise RuntimeError("Failed to fetch quota summary after token refresh")
 
 
 def read_history_summary(path: Path = HISTORY_FILE) -> dict:

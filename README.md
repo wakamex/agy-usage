@@ -64,6 +64,10 @@ Quota lookup mirrors the Antigravity CLI's own backend calls:
 1. `loadCodeAssist` with `{"metadata":{"ideType":"ANTIGRAVITY"}}`
 2. `retrieveUserQuotaSummary` using the returned `cloudaicompanionProject`
 
+Expired Antigravity OAuth access tokens are refreshed with the stored refresh
+token and the same Google OAuth client metadata used by the CLI, then written
+back to `antigravity-oauth-token`.
+
 ## Options
 
 ```text

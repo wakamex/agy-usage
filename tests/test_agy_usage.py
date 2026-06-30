@@ -5,6 +5,7 @@ import os
 import io
 import tempfile
 import unittest
+import urllib.error
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -173,6 +174,96 @@ class AgyUsageTests(unittest.TestCase):
                 mock.patch.dict(os.environ, {}, clear=True),
             ):
                 self.assertEqual(agy_usage.get_access_token(), "nested-token")
+
+    def test_expired_access_token_refreshes_and_persists_nested_token_file(self):
+        class FakeResponse:
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "access_token": "fresh-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                    }
+                ).encode()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            token_file = Path(tmp) / "antigravity-oauth-token"
+            _write_json(
+                token_file,
+                {
+                    "auth_method": "consumer",
+                    "token": {
+                        "access_token": "stale-token",
+                        "token_type": "Bearer",
+                        "refresh_token": "refresh-token",
+                        "expiry": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+                    },
+                },
+            )
+
+            with (
+                mock.patch.object(agy_usage, "TOKEN_FILE", token_file),
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(
+                    agy_usage,
+                    "_oauth_client_candidates",
+                    return_value=[("client-id", "client-secret")],
+                ),
+                mock.patch("urllib.request.urlopen", return_value=FakeResponse()) as urlopen_mock,
+            ):
+                token = agy_usage.get_access_token()
+
+            self.assertEqual(token, "fresh-token")
+            written = json.loads(token_file.read_text())
+            self.assertEqual(written["token"]["access_token"], "fresh-token")
+            self.assertEqual(written["token"]["refresh_token"], "refresh-token")
+            self.assertIn("client_secret", urlopen_mock.call_args.args[0].data.decode())
+
+    def test_fetch_quota_summary_refreshes_once_on_auth_error(self):
+        http_error = urllib.error.HTTPError(
+            url="https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+            code=401,
+            msg="Unauthorized",
+            hdrs={},
+            fp=None,
+        )
+        summary_response = {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [{"displayName": "Five Hour Limit", "remainingFraction": 0.75}],
+                }
+            ]
+        }
+
+        with (
+            mock.patch.object(
+                agy_usage,
+                "get_access_token",
+                side_effect=["stale-token", "fresh-token"],
+            ) as token_mock,
+            mock.patch.object(
+                agy_usage,
+                "_code_assist_post",
+                side_effect=[
+                    http_error,
+                    {"cloudaicompanionProject": "healthy-shore-gs5kt"},
+                    summary_response,
+                ],
+            ),
+        ):
+            summary = agy_usage.fetch_quota_summary()
+
+        self.assertEqual(summary["groups"][0]["buckets"][0]["remaining_pct"], 75.0)
+        token_mock.assert_has_calls([mock.call(), mock.call(force_refresh=True)])
 
     def test_build_usage_json_includes_history_when_quota_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
