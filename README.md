@@ -59,14 +59,10 @@ uv tool install .
 - Antigravity command history: `~/.gemini/antigravity-cli/history.jsonl`
 - Cache written by this tool: `~/.gemini/antigravity-cli/usage-limits.json`
 
-Quota lookup first uses the local Antigravity CLI language-server RPC, which
-is the source behind `agy`'s grouped "Models & Quota" display. Keep an `agy`
-session running for the closest match, or set `AGY_RPC_URL` to a known local
-RPC base URL.
+Quota lookup mirrors the Antigravity CLI's own backend calls:
 
-If the local RPC is unavailable, `agy-usage` falls back to the raw Code Assist
-quota flow Antigravity logs mention: `loadCodeAssist` followed by
-`retrieveUserQuota`.
+1. `loadCodeAssist` with `{"metadata":{"ideType":"ANTIGRAVITY"}}`
+2. `retrieveUserQuotaSummary` using the returned `cloudaicompanionProject`
 
 ## Options
 
@@ -83,6 +79,5 @@ usage: agy-usage [-h] [--root ROOT] [-i INTERVAL] [--max-age MAX_AGE]
 Environment overrides:
 
 - `AGY_USAGE_FILE`: alternate cache path
-- `AGY_RPC_URL`: local Antigravity RPC base URL, for example `http://127.0.0.1:42683`
 - `AGY_ACCESS_TOKEN`: provide an access token instead of reading Antigravity state
 - `AGY_CODE_ASSIST_BASE_URL`: alternate Code Assist base URL

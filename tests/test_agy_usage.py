@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import io
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -17,34 +18,6 @@ def _write_json(path: Path, payload: dict):
 
 
 class AgyUsageTests(unittest.TestCase):
-    def test_parse_quota_buckets_computes_usage_and_limit(self):
-        buckets = agy_usage._parse_quota_buckets(
-            [
-                {
-                    "modelId": "gemini-test",
-                    "remainingAmount": "25",
-                    "remainingFraction": 0.5,
-                    "resetTime": "2026-06-30T01:00:00Z",
-                }
-            ]
-        )
-
-        self.assertEqual(buckets[0]["model"], "gemini-test")
-        self.assertEqual(buckets[0]["remaining"], 25)
-        self.assertEqual(buckets[0]["limit"], 50)
-        self.assertEqual(buckets[0]["used_pct"], 50)
-
-    def test_summary_bucket_skips_disabled_and_picks_highest_used(self):
-        quota = {
-            "buckets": [
-                {"model": "disabled", "used_pct": 99, "disabled": True},
-                {"model": "flash", "used_pct": 10},
-                {"model": "pro", "used_pct": 75},
-            ]
-        }
-
-        self.assertEqual(agy_usage._select_summary_bucket(quota)["model"], "pro")
-
     def test_parse_quota_summary_groups(self):
         summary = agy_usage._parse_quota_summary(
             {
@@ -104,6 +77,62 @@ class AgyUsageTests(unittest.TestCase):
         self.assertIn("reset:", statusline)
         self.assertIn("model:Gemini_Test", statusline)
 
+    def test_fetch_quota_summary_uses_antigravity_project(self):
+        summary_response = {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [{"displayName": "Five Hour Limit", "remainingFraction": 0.5}],
+                }
+            ]
+        }
+
+        with (
+            mock.patch.object(agy_usage, "get_access_token", return_value="token"),
+            mock.patch.object(
+                agy_usage,
+                "_code_assist_post",
+                side_effect=[
+                    {"cloudaicompanionProject": "healthy-shore-gs5kt"},
+                    summary_response,
+                ],
+            ) as post_mock,
+        ):
+            summary = agy_usage.fetch_quota_summary()
+
+        self.assertEqual(summary["project_id"], "healthy-shore-gs5kt")
+        self.assertEqual(summary["source"], "quota_summary_api")
+        self.assertEqual(summary["groups"][0]["buckets"][0]["remaining_pct"], 50.0)
+        self.assertEqual(
+            post_mock.mock_calls,
+            [
+                mock.call(
+                    "loadCodeAssist",
+                    {"metadata": {"ideType": "ANTIGRAVITY"}},
+                    "token",
+                ),
+                mock.call(
+                    "retrieveUserQuotaSummary",
+                    {"project": "healthy-shore-gs5kt"},
+                    "token",
+                ),
+            ],
+        )
+
+    def test_print_status_reports_quota_summary_error(self):
+        data = {
+            "project_root": "/code/agy-usage",
+            "quota_summary_error": "HTTP Error 403: Forbidden",
+            "history": {"entries": 0},
+        }
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            agy_usage._print_status(data)
+
+        output = stdout.getvalue()
+        self.assertIn("Quota summary", output)
+        self.assertIn("HTTP Error 403: Forbidden", output)
+
     def test_read_history_summary_counts_commands_and_workspaces(self):
         with tempfile.TemporaryDirectory() as tmp:
             history = Path(tmp) / "history.jsonl"
@@ -161,14 +190,13 @@ class AgyUsageTests(unittest.TestCase):
                     "fetch_quota_summary",
                     side_effect=RuntimeError("no quota summary"),
                 ),
-                mock.patch.object(agy_usage, "fetch_quota", side_effect=RuntimeError("no quota")),
             ):
                 usage = agy_usage.build_usage_json(tmp_path)
 
         self.assertEqual(usage["model"], "Gemini Test")
         self.assertIn("history", usage["source"])
         self.assertEqual(usage["quota_summary_error"], "no quota summary")
-        self.assertEqual(usage["quota_error"], "no quota")
+        self.assertNotIn("account_quota", usage)
 
     def test_force_refresh_bypasses_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,12 +206,12 @@ class AgyUsageTests(unittest.TestCase):
             usage_file = tmp_path / "usage-limits.json"
             cached = {
                 "project_root": str(project_root.resolve()),
-                "source": ["quota_summary_rpc"],
+                "source": ["quota_summary_api"],
                 "updated_at": datetime.now(UTC).isoformat(),
             }
             fresh = {
                 "project_root": str(project_root.resolve()),
-                "source": ["quota_summary_rpc"],
+                "source": ["quota_summary_api"],
                 "updated_at": (datetime.now(UTC) + timedelta(seconds=1)).isoformat(),
             }
             usage_file.write_text(json.dumps(cached) + "\n")

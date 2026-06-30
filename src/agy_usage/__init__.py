@@ -4,21 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
-import re
 import signal
-import ssl
-import subprocess
 import sys
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 AGY_DIR = Path.home() / ".gemini" / "antigravity-cli"
 TOKEN_FILE = AGY_DIR / "antigravity-oauth-token"
@@ -29,7 +25,7 @@ DEFAULT_USAGE_FILE = AGY_DIR / "usage-limits.json"
 DAEMON_INTERVAL = 300
 CACHE_MAX_AGE = 300
 CODE_ASSIST_BASE_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal"
-QUOTA_SUMMARY_RPC = "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+AGY_USER_AGENT = "antigravity/cli/1.0.14 (aidev_client; os_type=linux; arch=amd64)"
 
 _TTY = sys.stdout.isatty()
 _RED = "\033[0;31m" if _TTY else ""
@@ -88,14 +84,6 @@ def _format_pct(pct: float | int | None) -> str:
     return f"{value:.2f}%"
 
 
-def _color_pct(pct: float | int | None) -> str:
-    if pct is None:
-        return "?"
-    value = float(pct)
-    color = _RED if value >= 70 else _YELLOW if value >= 40 else _GREEN
-    return f"{color}{_format_pct(value)}{_RESET}"
-
-
 def _color_remaining_pct(pct: float | int | None) -> str:
     if pct is None:
         return "?"
@@ -143,39 +131,20 @@ def _code_assist_post(method: str, payload: dict, access_token: str) -> dict:
     base_url = os.environ.get("AGY_CODE_ASSIST_BASE_URL", CODE_ASSIST_BASE_URL).rstrip("/")
     req = urllib.request.Request(
         f"{base_url}:{method}",
-        data=json.dumps(payload).encode(),
+        data=json.dumps(payload, separators=(",", ":")).encode(),
         headers={
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "agy-usage/0.1.1",
+            "Accept-Encoding": "gzip",
+            "User-Agent": AGY_USER_AGENT,
         },
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read())
-
-
-def _load_code_assist(access_token: str) -> dict:
-    project_id = (
-        os.environ.get("GOOGLE_CLOUD_PROJECT")
-        or os.environ.get("GOOGLE_CLOUD_PROJECT_ID")
-        or _read_default_project_id()
-    )
-    metadata: dict[str, Any] = {
-        "ideType": "IDE_UNSPECIFIED",
-        "platform": "PLATFORM_UNSPECIFIED",
-        "pluginType": "GEMINI",
-    }
-    if project_id:
-        metadata["duetProject"] = project_id
-    return _code_assist_post(
-        "loadCodeAssist",
-        {
-            "cloudaicompanionProject": project_id,
-            "metadata": metadata,
-        },
-        access_token,
-    )
+        body = resp.read()
+        if resp.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        return json.loads(body)
 
 
 def _read_default_project_id() -> str | None:
@@ -184,57 +153,6 @@ def _read_default_project_id() -> str | None:
     except OSError:
         return None
     return project_id or None
-
-
-def _local_rpc_base_urls() -> list[str]:
-    override = os.environ.get("AGY_RPC_URL") or os.environ.get("ANTIGRAVITY_RPC_URL")
-    if override:
-        return [override.rstrip("/")]
-
-    ports: list[str] = []
-    try:
-        result = subprocess.run(
-            ["ss", "-ltnp"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        result = None
-
-    if result:
-        for line in result.stdout.splitlines():
-            if '"agy"' not in line and "users:((agy," not in line:
-                continue
-            match = re.search(r"127\.0\.0\.1:(\d+)", line)
-            if match:
-                ports.append(match.group(1))
-
-    ports.extend(["42683", "42075"])
-    ordered_ports = list(dict.fromkeys(ports))
-    base_urls: list[str] = []
-    for port in ordered_ports:
-        base_urls.append(f"http://127.0.0.1:{port}")
-        base_urls.append(f"https://127.0.0.1:{port}")
-    return base_urls
-
-
-def _local_connect_post(base_url: str, rpc_path: str, payload: dict) -> dict:
-    req = urllib.request.Request(
-        f"{base_url.rstrip('/')}{rpc_path}",
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "agy-usage/0.1.1",
-        },
-    )
-    kwargs: dict[str, Any] = {"timeout": 4}
-    if base_url.startswith("https://"):
-        kwargs["context"] = ssl._create_unverified_context()
-    with urllib.request.urlopen(req, **kwargs) as resp:
-        return json.loads(resp.read())
 
 
 def _parse_quota_summary(summary: dict) -> dict:
@@ -272,104 +190,25 @@ def _parse_quota_summary(summary: dict) -> dict:
     return {"description": summary.get("description"), "groups": groups}
 
 
+def _load_antigravity_code_assist(access_token: str) -> dict:
+    return _code_assist_post(
+        "loadCodeAssist",
+        {"metadata": {"ideType": "ANTIGRAVITY"}},
+        access_token,
+    )
+
+
 def fetch_quota_summary() -> dict:
-    project_id = (
-        os.environ.get("GOOGLE_CLOUD_PROJECT")
-        or os.environ.get("GOOGLE_CLOUD_PROJECT_ID")
-        or _read_default_project_id()
-        or "default-cli-project"
-    )
-    payload = {"request": {"project": project_id}, "forceRefresh": True}
-    errors = []
-    for base_url in _local_rpc_base_urls():
-        try:
-            response = _local_connect_post(base_url, QUOTA_SUMMARY_RPC, payload)
-        except Exception as exc:
-            errors.append(f"{base_url}: {exc}")
-            continue
-        summary = response.get("response") if isinstance(response, dict) else None
-        if isinstance(summary, dict):
-            parsed = _parse_quota_summary(summary)
-            parsed["project_id"] = project_id
-            parsed["rpc_url"] = base_url
-            return parsed
-        errors.append(f"{base_url}: missing response")
-    raise RuntimeError("No running agy quota RPC found" + (f" ({'; '.join(errors[:3])})" if errors else ""))
-
-
-def _parse_quota_buckets(buckets: list[dict]) -> list[dict]:
-    parsed = []
-    for bucket in buckets:
-        remaining = None
-        limit = None
-        used_pct = None
-        remaining_fraction = bucket.get("remainingFraction")
-
-        try:
-            if bucket.get("remainingAmount") is not None:
-                remaining = int(bucket["remainingAmount"])
-        except (TypeError, ValueError):
-            remaining = None
-
-        if isinstance(remaining_fraction, int | float):
-            used_pct = (1 - float(remaining_fraction)) * 100
-        if remaining is not None and isinstance(remaining_fraction, int | float):
-            if remaining_fraction > 0:
-                limit = round(remaining / float(remaining_fraction))
-
-        parsed.append(
-            {
-                "model": bucket.get("modelId") or bucket.get("model"),
-                "remaining": remaining,
-                "limit": limit,
-                "used_pct": used_pct,
-                "remaining_fraction": remaining_fraction,
-                "reset_time": bucket.get("resetTime"),
-                "token_type": bucket.get("tokenType"),
-                "disabled": bool(bucket.get("disabled", False)),
-            }
-        )
-    return parsed
-
-
-def _select_summary_bucket(quota: dict) -> dict | None:
-    buckets = quota.get("buckets") or []
-    if not isinstance(buckets, list):
-        return None
-    active = [bucket for bucket in buckets if not bucket.get("disabled")]
-    scored = [bucket for bucket in active if bucket.get("used_pct") is not None]
-    if scored:
-        return max(scored, key=lambda bucket: bucket["used_pct"])
-    return active[0] if active else (buckets[0] if buckets else None)
-
-
-def fetch_quota() -> dict:
     access_token = get_access_token()
-    load_res = _load_code_assist(access_token)
-
-    project_id = (
-        load_res.get("cloudaicompanionProject")
-        or os.environ.get("GOOGLE_CLOUD_PROJECT")
-        or os.environ.get("GOOGLE_CLOUD_PROJECT_ID")
-        or _read_default_project_id()
-    )
+    load_res = _load_antigravity_code_assist(access_token)
+    project_id = load_res.get("cloudaicompanionProject")
     if not project_id:
-        raise RuntimeError("No Code Assist project ID available. Set GOOGLE_CLOUD_PROJECT if needed.")
-
-    quota_res = _code_assist_post("retrieveUserQuota", {"project": project_id}, access_token)
-    current_tier = load_res.get("currentTier") or {}
-    paid_tier = load_res.get("paidTier") or {}
-    result = {
-        "project_id": project_id,
-        "user_tier": paid_tier.get("id") or current_tier.get("id"),
-        "user_tier_name": paid_tier.get("name") or current_tier.get("name"),
-        "buckets": _parse_quota_buckets(quota_res.get("buckets") or []),
-    }
-    result["summary_bucket"] = _select_summary_bucket(result)
-    credits = quota_res.get("credits") or quota_res.get("g1Credits")
-    if credits is not None:
-        result["credits"] = credits
-    return result
+        raise RuntimeError("No Antigravity Code Assist project returned by loadCodeAssist")
+    summary = _code_assist_post("retrieveUserQuotaSummary", {"project": project_id}, access_token)
+    parsed = _parse_quota_summary(summary)
+    parsed["project_id"] = project_id
+    parsed["source"] = "quota_summary_api"
+    return parsed
 
 
 def read_history_summary(path: Path = HISTORY_FILE) -> dict:
@@ -429,14 +268,9 @@ def build_usage_json(project_root: Path | None = None) -> dict:
 
     try:
         result["quota_summary"] = fetch_quota_summary()
-        result["source"].append("quota_summary_rpc")
+        result["source"].append(result["quota_summary"].get("source") or "quota_summary")
     except Exception as summary_exc:
         result["quota_summary_error"] = str(summary_exc)
-        try:
-            result["account_quota"] = fetch_quota()
-            result["source"].append("quota_api")
-        except Exception as exc:
-            result["quota_error"] = str(exc)
 
     return result
 
@@ -486,34 +320,8 @@ def _print_status(data: dict):
                     f"{_color_remaining_pct(remaining_pct)} remaining  {reset_part}".rstrip()
                 )
     else:
-        quota = data.get("account_quota")
-        if quota:
-            bucket_names = [
-                (bucket.get("model") or "unknown")
-                for bucket in quota.get("buckets", [])
-                if isinstance(bucket, dict)
-            ]
-            name_width = max(map(len, bucket_names), default=len("Quota"))
-            for bucket in quota.get("buckets", []):
-                model_name = bucket.get("model") or "unknown"
-                if bucket.get("disabled"):
-                    print(f"  {model_name:{name_width}s} {_DIM}disabled{_RESET}")
-                    continue
-                reset_time = _format_duration_until(bucket.get("reset_time"))
-                reset_part = f"  resets {reset_time}" if reset_time else ""
-                remaining = bucket.get("remaining")
-                limit = bucket.get("limit")
-                remain_part = (
-                    f"  {remaining} / {limit} remaining"
-                    if remaining is not None and limit is not None
-                    else ""
-                )
-                print(
-                    f"  {model_name:{name_width}s} {_color_pct(bucket.get('used_pct'))} used"
-                    f"{remain_part}{_DIM}{reset_part}{_RESET}"
-                )
-        elif data.get("quota_error"):
-            print(f"  {'Quota':20s} {_DIM}{data['quota_error']}{_RESET}")
+        if data.get("quota_summary_error"):
+            print(f"  {'Quota summary':20s} {_DIM}{data['quota_summary_error']}{_RESET}")
 
     history = data.get("history") or {}
     if history.get("entries"):
@@ -557,17 +365,6 @@ def _statusline_text(data: dict) -> str:
                 reset_time = _format_duration_until(summary_bucket.get("reset_time"))
             if reset_time:
                 parts.append(f"reset:{reset_time}")
-    elif data.get("account_quota"):
-        quota = data["account_quota"]
-        if quota.get("summary_bucket"):
-            summary = quota["summary_bucket"]
-            if summary.get("disabled"):
-                parts.append("q:disabled")
-            elif summary.get("used_pct") is not None:
-                parts.append(f"q:{_format_pct(summary['used_pct'])}")
-            reset_time = _format_duration_until(summary.get("reset_time"))
-            if reset_time:
-                parts.append(f"reset:{reset_time}")
     elif data.get("quota_error"):
         parts.append("q:err")
 
@@ -590,7 +387,7 @@ def _get_cached_usage(
             updated = _parse_iso(cached.get("updated_at"))
             if updated and cached.get("project_root") == root:
                 age = (datetime.now(UTC) - updated).total_seconds()
-                quota_sources = {"quota_summary_rpc", "quota_api"}
+                quota_sources = {"quota_summary_api"}
                 if age < max_age and quota_sources.intersection(cached.get("source", [])):
                     return cached
         except Exception:
