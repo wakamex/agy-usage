@@ -39,6 +39,22 @@ _DIM = "\033[0;90m" if _TTY else ""
 _RESET = "\033[0m" if _TTY else ""
 
 
+def _find_agy_binary() -> Path | None:
+    agy_bin = shutil.which("agy")
+    if agy_bin:
+        return Path(agy_bin)
+
+    for candidate in [
+        Path.home() / ".local" / "bin" / "agy",
+        Path.home() / "bin" / "agy",
+        Path("/usr/local/bin/agy"),
+        Path("/usr/bin/agy"),
+    ]:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def _read_json(path: Path) -> dict | list | None:
     try:
         return json.loads(path.read_text())
@@ -148,12 +164,12 @@ def _oauth_client_candidates() -> list[tuple[str, str]]:
     if env_client_id and env_client_secret:
         return [(env_client_id, env_client_secret)]
 
-    agy_bin = shutil.which("agy")
+    agy_bin = _find_agy_binary()
     if not agy_bin:
-        raise RuntimeError("OAuth access token expired and `agy` is not on PATH")
+        raise RuntimeError("OAuth access token expired and could not find `agy`")
 
     try:
-        data = Path(agy_bin).read_bytes()
+        data = agy_bin.read_bytes()
     except OSError as exc:
         raise RuntimeError(f"OAuth access token expired and could not read {agy_bin}") from exc
 

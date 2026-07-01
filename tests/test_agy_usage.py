@@ -241,6 +241,27 @@ class AgyUsageTests(unittest.TestCase):
             self.assertEqual(written["token"]["refresh_token"], "refresh-token")
             self.assertIn("client_secret", urlopen_mock.call_args.args[0].data.decode())
 
+    def test_oauth_client_candidates_find_user_bin_when_path_is_sparse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            agy_bin = home / ".local" / "bin" / "agy"
+            agy_bin.parent.mkdir(parents=True)
+            client_id = "1071006060591-test.apps" + ".googleusercontent.com"
+            client_secret = "GO" + "CSPX-" + "abcdefghijklmnopqrstuvwxyz12"
+            agy_bin.write_bytes(client_id.encode() + b"\0" + client_secret.encode())
+            agy_bin.chmod(0o755)
+
+            with (
+                mock.patch.object(agy_usage.Path, "home", return_value=home),
+                mock.patch.dict(os.environ, {"PATH": ""}, clear=True),
+            ):
+                candidates = agy_usage._oauth_client_candidates()
+
+        self.assertEqual(
+            candidates,
+            [(client_id, client_secret)],
+        )
+
     def test_fetch_quota_summary_refreshes_once_on_auth_error(self):
         http_error = urllib.error.HTTPError(
             url="https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
