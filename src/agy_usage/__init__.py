@@ -11,6 +11,7 @@ import re
 import shutil
 import signal
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -134,10 +135,33 @@ def _get_token_payload(auth: dict) -> dict:
     return auth
 
 
-def _write_auth(auth: dict):
+def _auth_identity(auth: dict | None) -> tuple[object, object]:
+    if not auth:
+        return None, None
+    token_payload = _get_token_payload(auth)
+    access_token = token_payload.get("access_token") or token_payload.get("AccessToken")
+    refresh_token = token_payload.get("refresh_token") or auth.get("refresh_token")
+    return access_token, refresh_token
+
+
+def _write_auth(
+    auth: dict, expected_identity: tuple[object, object] | None = None
+) -> dict:
+    latest = get_auth()
+    if expected_identity and latest and _auth_identity(latest) != expected_identity:
+        return latest
+    if latest:
+        updated = {**latest, **auth}
+        if isinstance(latest.get("token"), dict) and isinstance(auth.get("token"), dict):
+            updated["token"] = {**latest["token"], **auth["token"]}
+        auth = updated
+
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = TOKEN_FILE.parent / (TOKEN_FILE.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{TOKEN_FILE.name}.", dir=TOKEN_FILE.parent
+    )
+    tmp = Path(tmp_name)
+    os.fchmod(fd, 0o600)
     try:
         with os.fdopen(fd, "w") as f:
             f.write(json.dumps(auth, indent=2) + "\n")
@@ -148,6 +172,7 @@ def _write_auth(auth: dict):
         except OSError:
             pass
         raise
+    return auth
 
 
 def _auth_expires_soon(auth: dict) -> bool:
@@ -210,6 +235,11 @@ def _refresh_access_token_with_client(refresh_token: str, client_id: str, client
 
 
 def refresh_access_token(auth: dict) -> dict:
+    expected_identity = _auth_identity(auth)
+    latest = get_auth()
+    if latest and _auth_identity(latest) != expected_identity:
+        return latest
+
     token_payload = _get_token_payload(auth)
     refresh_token = token_payload.get("refresh_token") or auth.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
@@ -224,6 +254,9 @@ def refresh_access_token(auth: dict) -> dict:
         except urllib.error.HTTPError as exc:
             last_error = exc
             if exc.code in (400, 401):
+                latest = get_auth()
+                if latest and _auth_identity(latest) != expected_identity:
+                    return latest
                 continue
             raise
     if result is None:
@@ -241,8 +274,7 @@ def refresh_access_token(auth: dict) -> dict:
         updated["token"] = updated_token
     else:
         updated.update(updated_token)
-    _write_auth(updated)
-    return updated
+    return _write_auth(updated, expected_identity=expected_identity)
 
 
 def get_access_token(force_refresh: bool = False) -> str:

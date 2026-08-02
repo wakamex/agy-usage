@@ -239,7 +239,63 @@ class AgyUsageTests(unittest.TestCase):
             written = json.loads(token_file.read_text())
             self.assertEqual(written["token"]["access_token"], "fresh-token")
             self.assertEqual(written["token"]["refresh_token"], "refresh-token")
+            self.assertEqual(token_file.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                list(token_file.parent.glob(".antigravity-oauth-token.*")), []
+            )
             self.assertIn("client_secret", urlopen_mock.call_args.args[0].data.decode())
+
+    def test_refresh_does_not_overwrite_concurrently_rotated_token(self):
+        class FakeResponse:
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(inner_self):
+                _write_json(token_file, replacement)
+                return json.dumps(
+                    {
+                        "access_token": "our-access",
+                        "refresh_token": "our-refresh",
+                        "expires_in": 3600,
+                    }
+                ).encode()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            token_file = Path(tmp) / "antigravity-oauth-token"
+            original = {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                },
+            }
+            replacement = {
+                "auth_method": "consumer",
+                "token": {
+                    "access_token": "other-access",
+                    "refresh_token": "other-refresh",
+                },
+            }
+            _write_json(token_file, original)
+
+            with (
+                mock.patch.object(agy_usage, "TOKEN_FILE", token_file),
+                mock.patch.object(
+                    agy_usage,
+                    "_oauth_client_candidates",
+                    return_value=[("client-id", "client-secret")],
+                ),
+                mock.patch("urllib.request.urlopen", return_value=FakeResponse()),
+            ):
+                result = agy_usage.refresh_access_token(original)
+
+            self.assertEqual(result, replacement)
+            self.assertEqual(json.loads(token_file.read_text()), replacement)
 
     def test_oauth_client_candidates_find_user_bin_when_path_is_sparse(self):
         with tempfile.TemporaryDirectory() as tmp:
