@@ -1,7 +1,6 @@
-name: publish
+name: Publish to PyPI
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - "v*"
@@ -11,10 +10,20 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      id-token: write
       contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv build
-      - run: uv publish
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: false
+      - name: Verify version tag
+        run: test "$GITHUB_REF_NAME" = "v$(uv version --short)"
+      - name: Test
+        run: uv run --locked python -m unittest discover -s tests
+      - name: Build
+        run: uv build --no-sources
+      - name: Publish
+        run: uv publish --trusted-publishing always
