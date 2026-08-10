@@ -403,7 +403,8 @@ def fetch_quota_summary() -> dict:
     raise RuntimeError("Failed to fetch quota summary after token refresh")
 
 
-def read_history_summary(path: Path = HISTORY_FILE) -> dict:
+def read_history_summary(path: Path | None = None) -> dict:
+    path = path or HISTORY_FILE
     commands: Counter[str] = Counter()
     workspaces: Counter[str] = Counter()
     total = 0
