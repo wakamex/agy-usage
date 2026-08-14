@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import math
 import os
 import re
 import shutil
@@ -329,17 +330,33 @@ def _read_default_project_id() -> str | None:
 
 
 def _parse_quota_summary(summary: dict) -> dict:
+    raw_groups = summary.get("groups")
+    if not isinstance(raw_groups, list):
+        raise ValueError("Invalid quota summary: groups must be an array")
+
     groups = []
-    for group in summary.get("groups") or []:
+    for group in raw_groups:
         if not isinstance(group, dict):
-            continue
+            raise ValueError("Invalid quota summary: each group must be an object")
+        raw_buckets = group.get("buckets")
+        if not isinstance(raw_buckets, list):
+            raise ValueError("Invalid quota summary: group buckets must be an array")
         buckets = []
-        for bucket in group.get("buckets") or []:
+        for bucket in raw_buckets:
             if not isinstance(bucket, dict):
-                continue
+                raise ValueError("Invalid quota summary: each bucket must be an object")
             remaining_fraction = bucket.get("remainingFraction")
             remaining_pct = None
-            if isinstance(remaining_fraction, int | float):
+            if "remainingFraction" in bucket:
+                if (
+                    isinstance(remaining_fraction, bool)
+                    or not isinstance(remaining_fraction, int | float)
+                    or not math.isfinite(remaining_fraction)
+                    or not 0 <= remaining_fraction <= 1
+                ):
+                    raise ValueError(
+                        "Invalid quota summary: remaining fraction must be between 0 and 1"
+                    )
                 remaining_pct = float(remaining_fraction) * 100
             buckets.append(
                 {

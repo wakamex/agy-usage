@@ -44,6 +44,48 @@ class AgyUsageTests(unittest.TestCase):
         self.assertEqual(summary["groups"][0]["buckets"][0]["display_name"], "Five Hour Limit")
         self.assertEqual(summary["groups"][0]["buckets"][0]["remaining_pct"], 62.5)
 
+    def test_parse_quota_summary_rejects_malformed_groups(self):
+        malformed = [
+            {},
+            {"groups": None},
+            {"groups": {}},
+            {"groups": "bad"},
+            {"groups": ["bad"]},
+            {"groups": [{}]},
+            {"groups": [{"buckets": {}}]},
+            {"groups": [{"buckets": ["bad"]}]},
+        ]
+        for summary in malformed:
+            with self.subTest(summary=summary):
+                with self.assertRaisesRegex(ValueError, "Invalid quota summary"):
+                    agy_usage._parse_quota_summary(summary)
+
+    def test_parse_quota_summary_preserves_missing_optional_fraction(self):
+        summary = agy_usage._parse_quota_summary(
+            {"groups": [{"buckets": [{"displayName": "Unavailable Limit"}]}]}
+        )
+
+        bucket = summary["groups"][0]["buckets"][0]
+        self.assertIsNone(bucket["remaining_fraction"])
+        self.assertIsNone(bucket["remaining_pct"])
+
+    def test_parse_quota_summary_rejects_malformed_remaining_fraction(self):
+        malformed = [None, True, "0.5", float("nan"), float("inf"), float("-inf"), -0.1, 1.1]
+        for remaining_fraction in malformed:
+            with self.subTest(remaining_fraction=remaining_fraction):
+                with self.assertRaisesRegex(ValueError, "remaining fraction"):
+                    agy_usage._parse_quota_summary(
+                        {
+                            "groups": [
+                                {
+                                    "buckets": [
+                                        {"remainingFraction": remaining_fraction}
+                                    ]
+                                }
+                            ]
+                        }
+                    )
+
     def test_statusline_uses_gemini_five_hour_remaining(self):
         reset_time = (datetime.now(UTC) + timedelta(minutes=7)).isoformat()
         data = {
