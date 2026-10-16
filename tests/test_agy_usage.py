@@ -409,6 +409,7 @@ class AgyUsageTests(unittest.TestCase):
             with (
                 mock.patch.object(agy_usage, "HISTORY_FILE", history),
                 mock.patch.object(agy_usage, "SETTINGS_FILE", settings),
+                mock.patch.dict(os.environ, {"AGY_USAGE_FILE": str(tmp_path / "usage.json")}),
                 mock.patch.object(agy_usage, "fetch_quota_summary", return_value={"plan": "Google AI Pro"}),
             ):
                 usage = agy_usage.build_usage_json(tmp_path)
@@ -418,6 +419,54 @@ class AgyUsageTests(unittest.TestCase):
         self.assertIn("history", usage["source"])
         self.assertNotIn("quota_summary_error", usage)
         self.assertNotIn("account_quota", usage)
+
+    def test_build_usage_json_records_groups_no_longer_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            usage_file = tmp_path / "usage.json"
+            _write_json(
+                usage_file,
+                {
+                    "quota_groups_last_seen": {
+                        "Gemini Models": "2026-10-15T21:14:00+00:00",
+                        "Claude and GPT models": "2026-10-15T21:14:00+00:00",
+                    }
+                },
+            )
+            summary = {"groups": [{"display_name": "Claude and GPT models", "buckets": []}]}
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_USAGE_FILE": str(usage_file)}),
+                mock.patch.object(agy_usage, "HISTORY_FILE", tmp_path / "history.jsonl"),
+                mock.patch.object(agy_usage, "SETTINGS_FILE", tmp_path / "settings.json"),
+                mock.patch.object(agy_usage, "fetch_quota_summary", return_value=summary),
+            ):
+                usage = agy_usage.build_usage_json(tmp_path)
+
+        self.assertEqual(
+            usage["quota_summary"]["missing_groups"],
+            [{"display_name": "Gemini Models", "last_seen_at": "2026-10-15T21:14:00+00:00"}],
+        )
+        self.assertEqual(
+            usage["quota_groups_last_seen"]["Claude and GPT models"], usage["updated_at"]
+        )
+
+    def test_user_agent_carries_installed_agy_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agy_bin = Path(tmp) / "agy"
+            agy_bin.write_text("#!/bin/sh\necho 9.8.7\n")
+            agy_bin.chmod(0o755)
+
+            with mock.patch.object(agy_usage, "_find_agy_binary", return_value=agy_bin):
+                user_agent = agy_usage._agy_user_agent()
+
+        self.assertTrue(user_agent.startswith("antigravity/cli/9.8.7 "))
+
+    def test_user_agent_falls_back_without_agy(self):
+        with mock.patch.object(agy_usage, "_find_agy_binary", return_value=None):
+            user_agent = agy_usage._agy_user_agent()
+
+        self.assertIn(f"/{agy_usage.AGY_FALLBACK_VERSION} ", user_agent)
 
     def test_force_refresh_bypasses_cache(self):
         with tempfile.TemporaryDirectory() as tmp:

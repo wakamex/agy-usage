@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -19,6 +20,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+from functools import cache
 from pathlib import Path
 
 AGY_DIR = Path.home() / ".gemini" / "antigravity-cli"
@@ -30,7 +32,9 @@ DEFAULT_USAGE_FILE = AGY_DIR / "usage-limits.json"
 DAEMON_INTERVAL = 300
 CACHE_MAX_AGE = 300
 CODE_ASSIST_BASE_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal"
-AGY_USER_AGENT = "antigravity/cli/1.0.14 (aidev_client; os_type=linux; arch=amd64)"
+# The quota service omits the Gemini group for clients older than the current
+# agy release, so requests carry the installed agy version.
+AGY_FALLBACK_VERSION = "1.4.0"
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 _TTY = sys.stdout.isatty()
@@ -55,6 +59,30 @@ def _find_agy_binary() -> Path | None:
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate
     return None
+
+
+@cache
+def _agy_version_at(path: str, _mtime_ns: int) -> str | None:
+    try:
+        result = subprocess.run(
+            [path, "--version"], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"\d+\.\d+\.\d+", result.stdout)
+    return match.group(0) if match else None
+
+
+def _agy_user_agent() -> str:
+    version = None
+    agy_bin = _find_agy_binary()
+    if agy_bin:
+        try:
+            version = _agy_version_at(str(agy_bin), agy_bin.stat().st_mtime_ns)
+        except OSError:
+            pass
+    version = version or AGY_FALLBACK_VERSION
+    return f"antigravity/cli/{version} (aidev_client; os_type=linux; arch=amd64)"
 
 
 def _read_json(path: Path) -> dict | list | None:
@@ -311,7 +339,7 @@ def _code_assist_post(method: str, payload: dict, access_token: str) -> dict:
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Accept-Encoding": "gzip",
-            "User-Agent": AGY_USER_AGENT,
+            "User-Agent": _agy_user_agent(),
         },
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
@@ -477,12 +505,24 @@ def build_usage_json(project_root: Path | None = None) -> dict:
     if result["history"]["entries"]:
         result["source"].append("history")
 
+    previous = _read_json(get_usage_file())
+    last_seen = previous.get("quota_groups_last_seen") if isinstance(previous, dict) else None
+    last_seen = dict(last_seen) if isinstance(last_seen, dict) else {}
     try:
         result["quota_summary"] = fetch_quota_summary()
         result["plan"] = result["quota_summary"].get("plan")
         result["source"].append(result["quota_summary"].get("source") or "quota_summary")
+        current = {group["display_name"] for group in result["quota_summary"].get("groups", [])}
+        for name in current:
+            last_seen[name] = result["updated_at"]
+        result["quota_summary"]["missing_groups"] = [
+            {"display_name": name, "last_seen_at": seen}
+            for name, seen in sorted(last_seen.items())
+            if name not in current
+        ]
     except Exception as summary_exc:
         result["quota_summary_error"] = str(summary_exc)
+    result["quota_groups_last_seen"] = last_seen
 
     return result
 
@@ -534,6 +574,10 @@ def _print_status(data: dict):
                     f"  {bucket_name:{name_width}s} "
                     f"{_color_remaining_pct(remaining_pct)} remaining  {reset_part}".rstrip()
                 )
+        for group in quota_summary.get("missing_groups", []):
+            print()
+            print(str(group.get("display_name") or "Quota").upper())
+            print(f"  {_DIM}not reported since {group.get('last_seen_at')}{_RESET}")
     else:
         if data.get("quota_summary_error"):
             print(f"  {'Quota summary':20s} {_DIM}{data['quota_summary_error']}{_RESET}")
