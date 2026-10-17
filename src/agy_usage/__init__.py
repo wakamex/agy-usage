@@ -609,10 +609,19 @@ def _pick_statusline_summary_bucket(quota_summary: dict) -> dict | None:
     return buckets[0] if buckets else None
 
 
+def _gemini_group_missing(quota_summary: dict) -> bool:
+    return any(
+        "gemini" in str(group.get("display_name") or "").lower()
+        for group in quota_summary.get("missing_groups") or []
+    )
+
+
 def _statusline_text(data: dict) -> str:
     parts = []
     quota_summary = data.get("quota_summary")
-    if quota_summary:
+    if quota_summary and _gemini_group_missing(quota_summary):
+        parts.append("q:gemini-missing")
+    elif quota_summary:
         summary_bucket = _pick_statusline_summary_bucket(quota_summary)
         if summary_bucket:
             if summary_bucket.get("disabled"):

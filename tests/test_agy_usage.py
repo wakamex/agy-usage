@@ -120,6 +120,23 @@ class AgyUsageTests(unittest.TestCase):
         self.assertIn("reset:", statusline)
         self.assertIn("model:Gemini_Test", statusline)
 
+    def test_statusline_flags_missing_gemini_group(self):
+        data = {
+            "quota_summary": {
+                "groups": [
+                    {
+                        "display_name": "Claude and GPT models",
+                        "buckets": [{"window": "5h", "remaining_pct": 100.0}],
+                    }
+                ],
+                "missing_groups": [
+                    {"display_name": "Gemini Models", "last_seen_at": "2026-10-15T21:14:00+00:00"}
+                ],
+            }
+        }
+
+        self.assertEqual(agy_usage._statusline_text(data), "q:gemini-missing")
+
     def test_subscription_plan_prefers_paid_tier(self):
         plan = agy_usage._parse_subscription_plan(
             {
